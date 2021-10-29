@@ -154,7 +154,6 @@ class Recognizer(object):
     
     def publish_interim_result(self, result):
         # Publish partial result if changed and if not empty
-        print(result)
         if result['partial'] != "" and self.last_partial != result['partial']:
             self.interim_speech_pub.publish(String(result['partial']))
         self.last_partial = result['partial']   
