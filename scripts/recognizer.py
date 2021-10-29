@@ -40,12 +40,12 @@ class Recognizer(object):
         current_dir = os.path.dirname(os.path.realpath(__file__))
         # Default model directory
         model_dir = os.path.realpath(os.path.join(current_dir, '..','models'))
-        self.model_dir= rospy.get_param('model_dir', model_dir)
+        self.model_dir= rospy.get_param('~model_dir', model_dir)
         # By default microphone is set to ALSA default, so can be changed in audio settings    
-        self.microphone_id = rospy.get_param('microphone', 'default')
+        self.microphone_id = rospy.get_param('~microphone', 'default')
 
         # Could use the device default sample rate by default
-        self.sample_rate = rospy.get_param('sampel_rate', None)
+        self.sample_rate = rospy.get_param('~sampel_rate', None)
         try:
             device_info = sounddevice.query_devices(self.microphone_id, 'input')
             # soundfile expects an int, sounddevice provides a float:
