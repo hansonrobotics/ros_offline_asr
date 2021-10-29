@@ -36,3 +36,21 @@ sample_rate:    ""              # Sample rate, by deefault it will use device de
 
 For microphone selection see: [sounddevice.query_devices](https://python-sounddevice.readthedocs.io/en/0.3.12/api.html#sounddevice.query_devices)
 
+Model names should correspond to language codes in dynamic reconfigure parameters:
+[cfg/OfflineAsr.cfg](cfg/OfflineAsr.cfg)
+
+### Dynamic Reconfigure 
+
+Following dynamic reconfigure parameters supported:
+```yaml
+enable:  false
+langauge: en-US # see cfg/Offline.asr for all options
+```
+
+## Topics published
+
+ROS node publishes the following topics
+
+**offline_speech** *(std_msgs/String)* - Publishes final result of speech recognition.
+
+**offline_interim_speech** *(std_msgs/String)* - Publishes interrim results as they are here
