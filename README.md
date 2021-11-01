@@ -47,6 +47,12 @@ enable:  false
 langauge: en-US # see cfg/Offline.asr for all options
 ```
 
+## Launching the node
+
+``` bash
+roslaunch ros_offline_asr offline_asr.launch
+```
+
 ## Topics published
 
 ROS node publishes the following topics
