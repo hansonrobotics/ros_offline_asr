@@ -20,12 +20,12 @@
 
 import os
 import logging
-import json
 import rospy
-import vosk
+import time
 import sounddevice
-from queue import Queue
-from threading import Event, Thread, Lock
+from ros_offline_asr.offline_speech_recognizer import OfflineSpeechRecognizer
+from queue import Empty
+from threading import Event, Thread
 from std_msgs.msg import String
 from ros_offline_asr.cfg import OfflineAsrConfig
 from dynamic_reconfigure.server import Server
@@ -43,64 +43,36 @@ class Recognizer(object):
         self.model_dir= rospy.get_param('~model_dir', model_dir)
         # By default microphone is set to ALSA default, so can be changed in audio settings    
         self.microphone_id = rospy.get_param('~microphone', 'default')
-
         # Could use the device default sample rate by default
         self.sample_rate = rospy.get_param('~sampel_rate', None)
         try:
             device_info = sounddevice.query_devices(self.microphone_id, 'input')
             # soundfile expects an int, sounddevice provides a float:
             if self.sample_rate is None:
-                self.samplerate = int(device_info['default_samplerate'])
+                self.sample_rate = int(device_info['default_samplerate'])
         except Exception as e:
             logger.error(f"Wasnt able to get device information {e}")
             exit(1)
         self.enabled = False
         self.enabled_e = Event()
+        self.recognizer = OfflineSpeechRecognizer(model_dir=self.model_dir, sample_rate=self.sample_rate)
+
         # Event to make sure Model is loaded
-        self.model_load_e = Event()
-        self.audio_q = Queue()
-        self.model_lock = Lock()
         self.speech_pub = rospy.Publisher('offline_speech', String, queue_size=1)
         self.interim_speech_pub = rospy.Publisher('offline_interim_speech', String, queue_size=1)
-        self.last_partial = ""
-        self.current_lang = ""
-        self.model = None
         self.reconfigure_srv = Server(OfflineAsrConfig, self.config_cb)
-        self.run()
-
-
-    def reload_model(self):
-        model_thread = Thread(target=self.load_model)
-        model_thread.daemon = True
-        model_thread.start()
-
-
-
-    def load_model(self):
-        # Make sure models are not reloaded simultaniously
-        with self.model_lock:
-            self.model = None
-            self.model_load_e.clear()
-            model_path = os.path.join(self.model_dir, self.current_lang)
-            if not os.path.exists(model_path):
-                logger.error(f"Model was not found at {model_path}")
-                # Make sure to update configuration so its clear there was an error
-                self.reconfigure_srv.update_configuration({'enable':False})
-                return
-            try:
-                # Load model 
-                m  = vosk.Model(model_path=model_path)
-                # Once model is loaded update reference
-                self.model = m
-                self.model_load_e.set()
-            except Exception as e:
-                self.reconfigure_srv.update_configuration({'enable':False})
-                logger.error(f"Model load failed with exception {e}")
-
+        # Streams audio to recognizer
+        self.audio_thread = Thread(target=self.capture_audio)
+        self.audio_thread.daemon = True
+        self.audio_thread.start()
+        # Publishes results
+        self.results_thread = Thread(target=self.publish_results)
+        self.results_thread.daemon = True
+        self.results_thread.start()
+    
     def config_cb(self, config, lvl=None):
-        if config.language != self.current_lang:
-            self.current_lang = config.language
-            self.reload_model()
+        # Set language
+        self.recognizer.change_language(config.language)
         if config.enable != self.enabled:
             if config.enable:
                 self.start_recognition()
@@ -108,59 +80,56 @@ class Recognizer(object):
                 self.stop_recognition()
         return config
     
+
+    def publish_results(self):
+        while not rospy.is_shutdown():
+            try:
+                res = self.recognizer.results.get(timeout=1.0)
+                self.publish_result(res)
+            except Empty:
+                continue
+
+
     def start_recognition(self):
         # Model should be loaded at this point
         self.enabled = True
         if not self.enabled_e.is_set():
             self.enabled_e.set()
+        self.recognizer.start()
 
     def stop_recognition(self):
         self.enabled = False
         self.enabled_e.clear()
+        self.recognizer.stop()
 
     def microphone_callback(self, indata, frames, time, status):
         """ Callback to read microphone data """
         if status:
             logger.warn(f"Microphone data returned {status}")
-        # Dtata storage
-        self.audio_q.put(bytes(indata))
+        # Put audio for recognition
+        self.recognizer.audio_recv(bytes(indata))
 
-    def run(self):
+    def capture_audio(self):
         while not rospy.is_shutdown():
             # Block until SR is enabled, dont block forever to gracefully exit if killed
             self.enabled_e.wait(timeout=1.0)
             if not self.enabled:
                 continue
-            # Block until SR is enabled, dont block forever to gracefully exit if killed
-            self.model_load_e.wait(timeout=1.0)
-            if not self.model_load_e.is_set():
-                continue
-            with sounddevice.RawInputStream(samplerate=self.samplerate, blocksize = 8000, device=self.microphone_id,
+            with sounddevice.RawInputStream(samplerate=self.sample_rate, blocksize = 8000, device=self.microphone_id,
                                             dtype='int16', channels=1, callback=self.microphone_callback):
-
-                rec = vosk.KaldiRecognizer(self.model, self.samplerate)
-                #rec.SetMaxAlternatives(3) - no need alternatives for now
-                # Require model to work
-                while self.enabled and self.model is not None and not rospy.is_shutdown():
-                    data = self.audio_q.get()
-                    if rec.AcceptWaveform(data):
-                        self.publish_result(json.loads(rec.Result()))
-                    else:
-                        self.publish_interim_result(json.loads(rec.PartialResult()))
+                while self.enabled and not rospy.is_shutdown():
+                    # Callback is used to get audio data, so can do nothing here
+                    time.sleep(0.1)
 
     def publish_result(self, result):
-        if result['text'] != "":
-            self.speech_pub.publish(String(result['text']))
-    
-    def publish_interim_result(self, result):
-        # Publish partial result if changed and if not empty
-        if result['partial'] != "" and self.last_partial != result['partial']:
+        if result.get('text', False):
+            self.speech_pub.publish(result['text'])
+        if result.get('partial', False):
             self.interim_speech_pub.publish(result['partial'])
-        self.last_partial = result['partial']
-
 
 if __name__ == '__main__':
     asr = Recognizer()
+    rospy.spin()
 
 
 
