@@ -1,2 +1,4 @@
 .vscode
 models/*
+__pycache__
+*.deb
