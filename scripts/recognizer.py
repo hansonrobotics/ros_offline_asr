@@ -53,10 +53,13 @@ class Recognizer(object):
         except Exception as e:
             logger.error(f"Wasnt able to get device information {e}")
             exit(1)
+        # Prevent for self listening in case echo cancalation is not
+        robot_speech_event_topic = rospy.get_param('robot_speech_event_topic', '/hr/control/speech/event')
+        rospy.Subscriber(robot_speech_event_topic, String, self.robot_speech_event_cb, queue_size=1)
+        self.paused = False
         self.enabled = False
         self.enabled_e = Event()
         self.recognizer = OfflineSpeechRecognizer(model_dir=self.model_dir, sample_rate=self.sample_rate)
-
         # Event to make sure Model is loaded
         self.speech_pub = rospy.Publisher('offline_speech', String, queue_size=1)
         self.interim_speech_pub = rospy.Publisher('offline_interim_speech', String, queue_size=1)
@@ -69,7 +72,27 @@ class Recognizer(object):
         self.results_thread = Thread(target=self.publish_results)
         self.results_thread.daemon = True
         self.results_thread.start()
+        
     
+    def robot_speech_event_cb(self, msg):
+        if not self.enabled:
+            return
+        """ Used in continuous listening mode """
+        if msg.data:
+            if msg.data.startswith('start'):
+                # Reset speech recognition then TTS starts (restarting after TTS finish might be too late).
+                self.paused = True
+                print('stopping recognition')
+                self.recognizer.stop()
+            if msg.data.startswith('stop') and self.paused:
+                self.paused = False
+                self.recognizer.start()
+            # wait for silence message if available
+            if msg.data.startswith('silence') and self.paused:
+                self.paused = False
+                self.recognizer.start()          
+
+
     def config_cb(self, config, lvl=None):
         # Set language
         self.recognizer.change_language(config.language)
@@ -115,9 +138,12 @@ class Recognizer(object):
             self.enabled_e.wait(timeout=1.0)
             if not self.enabled:
                 continue
+            if self.paused:
+                time.sleep(0.02)
+                continue
             with sounddevice.RawInputStream(samplerate=self.sample_rate, blocksize = 8000, device=self.microphone_id,
                                             dtype='int16', channels=1, callback=self.microphone_callback):
-                while self.enabled and not rospy.is_shutdown():
+                while self.enabled and not rospy.is_shutdown() and not self.paused:
                     # Callback is used to get audio data, so can do nothing here
                     time.sleep(0.1)
 
@@ -130,16 +156,3 @@ class Recognizer(object):
 if __name__ == '__main__':
     asr = Recognizer()
     rospy.spin()
-
-
-
-
-
-
-
-
-
-
-    
-        
-
