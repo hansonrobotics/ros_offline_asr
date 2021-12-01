@@ -35,17 +35,16 @@ package() {
     local desc="ROS Offline Speech recognition"
     local url="https://api.github.com/repos/hansonrobotics/$reponame/releases"
     
-    pushd "$BASEDIR/src/$reponame" >/dev/null
-    ./download_models.sh
-    popd >/dev/null
+    #pushd "$BASEDIR/src/$reponame" >/dev/null
+    #./download_models.sh
+    #popd >/dev/null
 
     fpm -C "${BASEDIR}" -s dir -t deb -n "${name}" -v "${version#v}" --vendor "${VENDOR}" \
         --url "${url}" --description "${desc}" ${ms} \
         --deb-no-default-config-files \
         -p $BASEDIR/${name}_VERSION_ARCH.deb \
         install/share=${HR_ROS_PREFIX}/ \
-        install/lib=${HR_ROS_PREFIX}/ \
-        src/$reponame/models=${HR_ROS_PREFIX}/lib/
+        install/lib=${HR_ROS_PREFIX}/
 
     cleanup_ros_package_build $BASEDIR
 }
