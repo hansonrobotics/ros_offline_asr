@@ -115,8 +115,7 @@ class OfflineSpeechRecognizer(object):
                 self.model_load_e.wait(timeout=1.0)
             
             rec = vosk.KaldiRecognizer(self.model, self.sample_rate)
-            #rec.SetMaxAlternatives(3) - no need alternatives for now
-            # Require model to work
+            rec.SetMaxAlternatives(5)
             while self.enabled and self.model is not None:
                 data = self.audio_q.get()
                 if rec.AcceptWaveform(data):
@@ -127,14 +126,19 @@ class OfflineSpeechRecognizer(object):
             self.running = False
 
     def publish_result(self, result):
-        if result['text'] != "":
-            self.results.put(result)
+        results = result['alternatives']
+        for r in results:
+            # If one of alternatives are no speech, ignore as likely it will be inacurate
+            if r['text'] == '':
+                return
+        self.results.put(results[0])
     
     def publish_interim_result(self, result):
         # Publish partial result if changed and if not empty
         if result['partial'] != "" and self.last_partial != result['partial']:
             self.results.put(result)
         self.last_partial = result['partial']
+        pass
 
 
 
