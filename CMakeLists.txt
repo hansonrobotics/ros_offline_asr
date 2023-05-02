@@ -159,6 +159,7 @@ include_directories(
 
 install(PROGRAMS
   scripts/recognizer.py
+  scripts/whisper_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
