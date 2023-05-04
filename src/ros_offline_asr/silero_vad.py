@@ -31,6 +31,7 @@ class SileroVad:
     def vad(self, sound):
         sound = self.int2float(sound)
         voice_confidence = self.model(torch.from_numpy(sound), 16000).item()
+        self.model.reset_states()
         if self.event and voice_confidence >= self.confidence:
             self.event.set()
         #print(voice_confidence)
