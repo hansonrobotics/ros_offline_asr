@@ -55,7 +55,7 @@ class WhipseNode(DDRNode):
         # Make silvero VAD, 
         # TODO publish vad messages
         self.vad_event = Event()
-        silero_model = os.path.join(self.model_dir,'silero_vad','silero_vad.jit')
+        silero_model = os.path.join(self.model_dir,'silero_vad','silero_vad.onnx')
         self.sileroVad = SileroVad(silero_model, self.vad_confidence, self.vad_sensitivity, event=self.vad_event)
         # Make speech recorder
         self.speech_recorder = SpeechRecorder(self.sileroVad.vad, self.microphone_id)
