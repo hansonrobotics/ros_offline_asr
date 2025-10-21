@@ -4,80 +4,170 @@ import threading
 import queue
 import time
 import wave
+import torch
+from silero_vad import VADIterator
+from silero_vad import load_silero_vad
 
 class SpeechRecorder:
-    def __init__(self, vad, microphone,  buffer_duration=0.5, silence_duration=0.5, chunk_size=0.1, vad_window=0.2, sample_rate=16000):
+    def __init__(self,
+                 microphone,
+                 sample_rate=16000,
+                 threshold: float = 0.5,
+                 min_silence_duration_ms: int = 400,
+                 speech_pad_ms: int = 200,
+                 buffer_duration: float = 0.5):
         self.device = microphone
         self.enabled = True
-        self.vad = vad
-        self.buffer_duration = buffer_duration
-        self.silence_duration = silence_duration
-        self.chunk_size = chunk_size
-        self.vad_window = vad_window
-        self.sample_rate = sample_rate
+        self.sample_rate = int(sample_rate)
+        self.threshold = float(threshold)
+        self.min_silence_duration_ms = int(min_silence_duration_ms)
+        self.speech_pad_ms = int(speech_pad_ms)
+        self.buffer_duration = float(buffer_duration)
 
+        # Queues
         self.recorded_queue = queue.Queue()
+        self._chunk_q = queue.Queue()
 
-        self.audio_buffer = np.zeros(shape=(0,), dtype=np.int16)
+        # Ring buffer to keep pre-roll audio (float32)
+        self._ring = np.zeros(shape=(0,), dtype=np.float32)
         self.buffer_lock = threading.Lock()
         self.recording = False
-        self.recording_data = np.zeros(shape=(0,), dtype=np.int16)
-        self.last_vad_time = 0
+        self.recording_data = np.zeros(shape=(0,), dtype=np.float32)
+
+        # Load Silero VAD (onnx) and create iterator
+        self.vad = load_silero_vad(onnx=True)
+        self.vad_iterator = VADIterator(
+            self.vad,
+            threshold=self.threshold,
+            sampling_rate=self.sample_rate,
+            min_silence_duration_ms=self.min_silence_duration_ms,
+            speech_pad_ms=self.speech_pad_ms,
+        )
+
+        # Streaming counters
+        self._chunk_samples = 512 if self.sample_rate == 16000 else 256
+        self._samples_seen = 0
+
+    def reconfigure(self, threshold: float = None, min_silence_duration_ms: int = None, speech_pad_ms: int = None):
+        updated = False
+        if threshold is not None and float(threshold) != self.threshold:
+            self.threshold = float(threshold)
+            updated = True
+        if min_silence_duration_ms is not None and int(min_silence_duration_ms) != self.min_silence_duration_ms:
+            self.min_silence_duration_ms = int(min_silence_duration_ms)
+            updated = True
+        if speech_pad_ms is not None and int(speech_pad_ms) != self.speech_pad_ms:
+            self.speech_pad_ms = int(speech_pad_ms)
+            updated = True
+        if updated:
+            # Recreate iterator with new params
+            self.vad_iterator = VADIterator(
+                self.vad,
+                threshold=self.threshold,
+                sampling_rate=self.sample_rate,
+                min_silence_duration_ms=self.min_silence_duration_ms,
+                speech_pad_ms=self.speech_pad_ms,
+            )
+            self.vad_iterator.reset_states()
 
     def record_callback(self, indata, frames, time, status):
         if not self.enabled:
             return
-        with self.buffer_lock:
-            self.audio_buffer = np.concatenate((self.audio_buffer, indata[:, 0].astype(np.int16)))
-            buffer_len = int(self.buffer_duration * self.sample_rate)
-            if len(self.audio_buffer) > buffer_len:
-                self.audio_buffer = self.audio_buffer[-buffer_len:]
+        # Expect float32 input in [-1, 1] shape (frames, 1)
+        # Push mono chunk to processing queue
+        try:
+            chunk = indata[:, 0].astype(np.float32, copy=True)
+        except Exception:
+            # Fallback if shape unexpected
+            chunk = np.asarray(indata).astype(np.float32).reshape(-1)
+        # Enforce fixed window size expected by model
+        if len(chunk) != self._chunk_samples:
+            # If driver delivers different frames, reslice/pad to window
+            if len(chunk) > self._chunk_samples:
+                chunk = chunk[:self._chunk_samples]
+            else:
+                pad = np.zeros(self._chunk_samples - len(chunk), dtype=np.float32)
+                chunk = np.concatenate([chunk, pad])
+        self._chunk_q.put(chunk)
 
     def vad_thread_func(self):
+        buffer_len = int(self.buffer_duration * self.sample_rate)
         while True:
-            if self.enabled and len(self.audio_buffer) >= int(self.vad_window * self.sample_rate):
-                with self.buffer_lock:
-                    # This chunk needed for VAD
-                    vad_chunk = self.audio_buffer[:int(self.vad_window * self.sample_rate)]
-                    # Rolling window 
-                    chunk = self.audio_buffer[:int(self.chunk_size * self.sample_rate)]
-                    self.audio_buffer = self.audio_buffer[int(self.chunk_size * self.sample_rate):]
-                if self.vad(vad_chunk):
-                    self.last_vad_time = time.time()
-                    if not self.recording:
-                        self.recording = True
-                    self.recording_data = np.concatenate((self.recording_data, chunk))
-                elif self.recording and time.time() - self.last_vad_time > self.silence_duration:
-                    self.recording = False
-                    self.recorded_queue.put(self.recording_data)
-                    self.recording_data = np.zeros(shape=(0,), dtype=np.int16)
-                elif self.recording:
-                    self.recording_data = np.concatenate((self.recording_data, chunk))
-                else:
-                    # IF not recording, keep the buffer at max buffer_druteation
-                    self.recording_data = np.concatenate((self.recording_data, chunk))
-                    self.recording_data = self.recording_data[-int(self.buffer_duration * self.sample_rate):]
-            time.sleep(self.chunk_size/2.0)
+            if not self.enabled:
+                time.sleep(0.01)
+                continue
+
+            try:
+                chunk_f32 = self._chunk_q.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            # Prepare tensors for VADIterator
+            x = torch.from_numpy(chunk_f32).unsqueeze(0)  # [1, N]
+            event = self.vad_iterator(x)
+
+            # If start detected, include pre-roll from ring based on reported start index
+            if event and 'start' in event and not self.recording:
+                print("Start")
+                start_idx = int(event['start'])
+                pre_needed = max(self._samples_seen - start_idx, 0)
+                if pre_needed > 0:
+                    pre_needed = int(min(pre_needed, len(self._ring)))
+                    if pre_needed > 0:
+                        self.recording_data = np.concatenate((self.recording_data, self._ring[-pre_needed:]))
+                self.recording = True
+
+            # While recording, append current chunk
+            if self.recording:
+                self.recording_data = np.concatenate((self.recording_data, chunk_f32))
+
+            # If end detected, finalize utterance
+            if event and 'end' in event and self.recording:
+                print("end")
+                # Compute and print simple level metrics for this utterance
+                if len(self.recording_data) > 0:
+                    dur_s = len(self.recording_data) / float(self.sample_rate)
+                    mean_abs = float(np.mean(np.abs(self.recording_data)))
+                    rms = float(np.sqrt(np.mean(self.recording_data ** 2)))
+                    dbfs = 20.0 * np.log10(max(rms, 1e-12))
+                    print(f"Utterance: {dur_s:.2f}s, mean|x|={mean_abs:.4f}, rms={rms:.4f}, dBFS={dbfs:.1f}")
+                    print(self.vad_iterator.threshold)
+                # Push only if we have at least 0.2s of audio
+                if len(self.recording_data) > int(0.2 * self.sample_rate):
+                    self.recorded_queue.put(self.recording_data.copy())
+                self.recording = False
+                self.recording_data = np.zeros(shape=(0,), dtype=np.float32)
+                self.vad_iterator.reset_states()
+
+            # Update ring buffer and counters
+            with self.buffer_lock:
+                self._ring = np.concatenate((self._ring, chunk_f32))
+                if len(self._ring) > buffer_len:
+                    self._ring = self._ring[-buffer_len:]
+            self._samples_seen += self._chunk_samples
 
     def save_thread_func(self):
         file_num = 1
         while True:
             recording_data = self.recorded_queue.get()
-            with wave.open(f'recording_{file_num}.wav', 'wb') as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(self.sample_rate)
-                wav_file.writeframes(recording_data)
+            # Write IEEE float32 WAV for debugging
+            data = np.asarray(recording_data, dtype=np.float32)
+            header = self._build_float_wav_header(len(data), self.sample_rate, 1)
+            with open(f'recording_{file_num}.wav', 'wb') as f:
+                f.write(header)
+                f.write(data.tobytes())
             file_num += 1
 
     def pause(self, ignore_recorded=False):
         with self.buffer_lock:
-            self.audio_buffer = np.zeros(shape=(0,), dtype=np.int16)
+            self._ring = np.zeros(shape=(0,), dtype=np.float32)
         if not ignore_recorded:
             # At least 0.2 seconds recording needed
             if self.recording and len(self.recording_data) > 0.2 * self.sample_rate:
                 self.recorded_queue.put(self.recording_data)
-                self.recording_data = np.zeros(shape=(0,), dtype=np.int16)
+                self.recording_data = np.zeros(shape=(0,), dtype=np.float32)
+        # Reset iterator state between sessions
+        self.vad_iterator.reset_states()
 
             
 
@@ -91,19 +181,43 @@ class SpeechRecorder:
             time.sleep(0.01)
             # Start audio recording
             if self.enabled:
-                with sd.InputStream(callback=self.record_callback,device=self.device, channels=1, dtype=np.int16, samplerate=self.sample_rate):
+                with sd.InputStream(callback=self.record_callback,
+                                    device=self.device,
+                                    channels=1,
+                                    dtype='float32',
+                                    blocksize=self._chunk_samples,
+                                    samplerate=self.sample_rate):
                     while self.enabled:
                         time.sleep(0.1)
-                    # Rest buffers
+                    # Reset buffers
                     self.pause(ignore_recorded=True)
 
+    @staticmethod
+    def _build_float_wav_header(num_samples: int, sample_rate: int, channels: int) -> bytes:
+        import struct
+        bits_per_sample = 32
+        byte_rate = sample_rate * channels * (bits_per_sample // 8)
+        block_align = channels * (bits_per_sample // 8)
+        subchunk1_size = 16  # fmt chunk size
+        audio_format = 3     # IEEE float
+        data_size = num_samples * (bits_per_sample // 8)
+        chunk_size = 4 + (8 + subchunk1_size) + (8 + data_size)
 
+        header = struct.pack(
+            '<4sI4s4sIHHIIHH4sI',
+            b'RIFF', chunk_size, b'WAVE',
+            b'fmt ', subchunk1_size, audio_format, channels, sample_rate, byte_rate, block_align, bits_per_sample,
+            b'data', data_size
+        )
+        return header
 
 
 if __name__ == "__main__":
-    from .silero_vad import SileroVad
-    Vad = SileroVad("/home/hr/workspace/hrsdk_configs/models/silero_vad/silero_vad.jit", 0.8)
-    recorder = SpeechRecorder(vad=Vad.vad)
-    recorder.start()
-
-
+    # Simple smoke test: print recorded chunk lengths
+    rec = SpeechRecorder(microphone='default')
+    t = threading.Thread(target=rec.start)
+    t.daemon = True
+    t.start()
+    while True:
+        data = rec.recorded_queue.get()
+        print(f"Recorded chunk length: {len(data)} samples")
