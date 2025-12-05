@@ -1,3 +1,2 @@
 vosk
 sounddevice
-faster-whisper==0.5.1
